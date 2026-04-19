@@ -3,6 +3,7 @@
 
 !.gitignore
 !Kyiv-1996.cst
+!Kyiv-2026.cst
 !README.txt
 !script_export_as_plot.gp
 !script_export_as_splot.gp
