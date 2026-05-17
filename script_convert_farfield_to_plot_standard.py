@@ -1,42 +1,110 @@
 """
 Convert CST farfield TXT export to one .plot matrix file.
 
-What this version does:
-- reads CST numeric table after the dashed separator line
-- uses column 1 = theta, column 2 = phi, column 3 = Abs(Dir.) by default
-- converts phi from CST 0..360 style to standard -180..180
-- keeps only theta in 0..90
-- normalizes all values so that max(value) = 1
-- writes ONE output file: <input_name>.raw.txt.plot
+Coordinate systems
+------------------
 
-Usage:
-  python script_convert_farfield_to_plot.py "farfield (f=44) [1(1)].txt"
-  python script_convert_farfield_to_plot.py /path/to/folder
+CST (Image 1):
+  - Z_cst : along antenna longitudinal axis (beam direction)
+  - X_cst : transverse horizontal
+  - Y_cst : vertical (up)
+  - theta_cst in [0, 180] measured from Z_cst
+  - phi_cst   in [0, 360) measured from X_cst
 
-Optional flags:
-  --no-normalize        Do not normalize values
-  --theta-max 180       Change theta cutoff, default is 90
-  --value-column 2      Zero-based numeric column index, default 2 = Abs(Dir.)
+Article / math standard (Fig. 4):
+  - Z_art : vertical (up)  — theta measured from this axis
+  - X_art : longitudinal antenna axis (horizontal)
+  - Y_art : transverse horizontal
+  - theta_art in [0, 90]
+  - phi_art   in (-180, 180]
+
+Axis mapping (CST Cartesian -> Article Cartesian):
+  X_art = Y_cst   (longitudinal — antenna lies along Y in CST)
+  Y_art = X_cst   (transverse horizontal)
+  Z_art = Z_cst   (vertical — Z is up in both systems)
+
+WHY INTERPOLATION IS REQUIRED
+------------------------------
+The CST grid (integer theta_cst x integer phi_cst) maps to an
+IRREGULAR scatter of (theta_art, phi_art) points — not a regular grid.
+Direct binning leaves most cells empty (nan).
+Solution: scatter -> scipy.interpolate.griddata -> regular article grid.
 """
 
 import argparse
 import glob
 import os
-import sys
-from typing import Dict, List, Tuple
+from typing import List, Tuple
+
+import numpy as np
+from scipy.interpolate import griddata
 
 
-def phi_to_standard(phi: float) -> float:
-    """Convert phi to [-180, 180]. Keeps +180 instead of turning it into -180."""
-    p = ((phi + 180.0) % 360.0) - 180.0
+# ---------------------------------------------------------------------------
+# Coordinate transform
+# ---------------------------------------------------------------------------
 
-    # If CST has exactly 180, keep it as +180 for nicer axis ordering.
-    # 540, 900, etc. also map to +180.
-    if abs(p + 180.0) < 1e-9 and phi > 0:
-        return 180.0
+def cst_to_article_cartesian(
+    theta_cst_deg: np.ndarray,
+    phi_cst_deg: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """CST spherical -> Article Cartesian (vectorised)."""
+    th = np.deg2rad(theta_cst_deg)
+    ph = np.deg2rad(phi_cst_deg)
 
-    return p
+    x_cst = np.sin(th) * np.cos(ph)
+    y_cst = np.sin(th) * np.sin(ph)
+    z_cst = np.cos(th)
 
+    # Axis permutation
+    x_art = y_cst   # longitudinal antenna axis (antenna along Y in CST)
+    y_art = x_cst   # transverse horizontal
+    z_art = z_cst   # vertical (Z is up in both systems)
+
+    return x_art, y_art, z_art
+
+
+def cartesian_to_article_spherical(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Article Cartesian -> article spherical (theta in [0,180], phi in (-180,180])."""
+    r = np.sqrt(x**2 + y**2 + z**2)
+    theta = np.rad2deg(np.arccos(np.clip(z / r, -1.0, 1.0)))
+    phi = np.rad2deg(np.arctan2(y, x))
+
+    # Wrap phi to (-180, 180]
+    phi = ((phi + 180.0) % 360.0) - 180.0
+    phi = np.where(phi == -180.0, 180.0, phi)
+
+    return theta, phi
+
+
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
+def build_output_name(input_file: str) -> str:
+    base, _ = os.path.splitext(input_file)
+    return base + ".raw.txt.plot"
+
+
+def find_farfield_files(directory: str) -> List[str]:
+    patterns = [
+        os.path.join(directory, "*_farfield*.txt"),
+        os.path.join(directory, "*farfield*.txt"),
+        os.path.join(directory, "*.txt"),
+    ]
+    files: List[str] = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    return sorted(set(files))
+
+
+# ---------------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------------
 
 def parse_farfield_file(
     input_file: str,
@@ -44,178 +112,199 @@ def parse_farfield_file(
     theta_max: float = 90.0,
     normalize: bool = True,
     value_column: int = 2,
+    theta_step: float = 1.0,
+    phi_step: float = 1.0,
+    interp_method: str = "linear",
 ) -> None:
-    data: Dict[float, Dict[float, float]] = {}
-    theta_values = set()
-    phi_values = set()
-    values: List[float] = []
+    """
+    Parse one CST farfield TXT, transform coordinates, interpolate onto
+    a regular article grid, and write a .plot matrix.
 
+    Output matrix layout:
+      rows  = phi_art  values (sorted ascending, from -180 to +180)
+      cols  = theta_art values (sorted ascending, from 0 to theta_max)
+    """
+    # ---- read raw data ---------------------------------------------------
+    rows_cst = []
     in_table = False
-    total_rows = 0
-    kept_rows = 0
 
     with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             s = line.strip()
-
             if not s:
                 continue
-
             if s.startswith("---"):
                 in_table = True
                 continue
-
             if not in_table:
                 continue
-
             parts = s.split()
             if len(parts) <= value_column:
                 continue
-
             try:
-                theta = float(parts[0])
-                phi = float(parts[1])
-                val = float(parts[value_column])
+                rows_cst.append((float(parts[0]), float(parts[1]), float(parts[value_column])))
             except ValueError:
                 continue
 
-            total_rows += 1
+    if not rows_cst:
+        raise RuntimeError(f"No numeric rows found in: {input_file}")
 
-            # Requirement: theta must be 0..90 by default.
-            if theta < 0.0 or theta > theta_max:
-                continue
+    theta_cst = np.array([r[0] for r in rows_cst])
+    phi_cst   = np.array([r[1] for r in rows_cst])
+    values    = np.array([r[2] for r in rows_cst])
 
-            phi_std = phi_to_standard(phi)
+    # ---- transform to article spherical ----------------------------------
+    x_art, y_art, z_art = cst_to_article_cartesian(theta_cst, phi_cst)
+    theta_art, phi_art  = cartesian_to_article_spherical(x_art, y_art, z_art)
 
-            if phi_std not in data:
-                data[phi_std] = {}
+    # ---- filter to upper hemisphere --------------------------------------
+    mask = (theta_art >= 0.0) & (theta_art <= theta_max)
+    theta_art = theta_art[mask]
+    phi_art   = phi_art[mask]
+    values    = values[mask]
 
-            # If duplicate phi appears after conversion, keep the later value.
-            # In normal CST export with 0..360 this usually only affects edge cases.
-            data[phi_std][theta] = val
-            theta_values.add(theta)
-            phi_values.add(phi_std)
-            values.append(val)
-            kept_rows += 1
-
-    if not values:
+    if len(values) == 0:
         raise RuntimeError(
-            f"No numeric farfield rows were parsed from {input_file}. "
-            f"Check input format or --value-column."
+            f"All rows filtered out. Try --theta-max 180."
         )
 
-    max_value = max(values)
+    # ---- build regular output grid ---------------------------------------
+    theta_grid_vals = np.arange(0.0, theta_max + theta_step * 0.5, theta_step)
+    phi_grid_vals   = np.arange(-180.0, 180.0 + phi_step * 0.5, phi_step)
+
+    # Clip to avoid floating-point overshoot
+    theta_grid_vals = theta_grid_vals[theta_grid_vals <= theta_max + 1e-9]
+    phi_grid_vals   = phi_grid_vals[phi_grid_vals <= 180.0 + 1e-9]
+
+    THETA_GRID, PHI_GRID = np.meshgrid(theta_grid_vals, phi_grid_vals)  # (n_phi, n_theta)
+
+    # ---- interpolate scatter -> grid -------------------------------------
+    # For phi near ±180 boundary: duplicate points shifted by ±360 to avoid edge artifacts
+    phi_ext   = np.concatenate([phi_art - 360.0, phi_art, phi_art + 360.0])
+    theta_ext = np.tile(theta_art, 3)
+    values_ext = np.tile(values, 3)
+
+    points  = np.column_stack([theta_ext, phi_ext])
+    grid_values = griddata(
+        points,
+        values_ext,
+        (THETA_GRID, PHI_GRID),
+        method=interp_method,
+        fill_value=np.nan,
+    )
+
+    # ---- normalize -------------------------------------------------------
+    max_value = float(np.nanmax(values))
     if normalize:
         if max_value == 0.0:
-            raise RuntimeError("Cannot normalize: max value is 0")
-        for phi in data:
-            for theta in data[phi]:
-                data[phi][theta] = data[phi][theta] / max_value
+            raise RuntimeError("Cannot normalize: max value is 0.")
+        grid_values = grid_values / max_value
 
-    theta_list = sorted(theta_values)
-    phi_list = sorted(phi_values)
-
+    # ---- write output ----------------------------------------------------
     with open(output_file, "w", encoding="utf-8") as out:
-        for phi in phi_list:
-            row = []
-            for theta in theta_list:
-                if theta in data.get(phi, {}):
-                    row.append(f"{data[phi][theta]:.6e}")
-                else:
-                    row.append("nan")
-            out.write(" ".join(row) + "\n")
+        for row in grid_values:
+            out.write(" ".join("nan" if np.isnan(v) else f"{v:.6e}" for v in row) + "\n")
 
-    normalized_max = 1.0 if normalize else max_value
+    # ---- report ----------------------------------------------------------
+    nan_count = int(np.sum(np.isnan(grid_values)))
+    total_cells = grid_values.size
+    output_max = 1.0 if normalize else max_value
 
     print("Done")
-    print("Input          :", input_file)
-    print("Output         :", output_file)
-    print("Rows read      :", total_rows)
-    print("Rows kept      :", kept_rows)
-    print("Theta count    :", len(theta_list))
-    print("Theta range    :", f"{theta_list[0]} .. {theta_list[-1]}")
-    print("Phi count      :", len(phi_list))
-    print("Phi range      :", f"{phi_list[0]} .. {phi_list[-1]}")
-    print("Original max   :", f"{max_value:.6e}")
-    print("Output max     :", f"{normalized_max:.6e}")
-    print("Normalized     :", normalize)
+    print(f"  Input          : {input_file}")
+    print(f"  Output         : {output_file}")
+    print(f"  Scatter points : {len(values)}")
+    print(f"  Grid size      : {len(phi_grid_vals)} phi x {len(theta_grid_vals)} theta = {total_cells} cells")
+    print(f"  NaN cells      : {nan_count} ({100*nan_count/total_cells:.1f}%)")
+    print(f"  Theta range    : {theta_grid_vals[0]} .. {theta_grid_vals[-1]}  step={theta_step}")
+    print(f"  Phi range      : {phi_grid_vals[0]} .. {phi_grid_vals[-1]}  step={phi_step}")
+    print(f"  Raw max        : {max_value:.6e}")
+    print(f"  Output max     : {output_max:.6e}  (normalized={normalize})")
+    print(f"  Interp method  : {interp_method}")
     print("-" * 60)
 
 
-def build_output_name(input_file: str) -> str:
-    base, _ = os.path.splitext(input_file)
-    return base + ".raw.txt.plot"
+# ---------------------------------------------------------------------------
+# Path dispatcher
+# ---------------------------------------------------------------------------
 
-
-def find_farfield_files(path: str) -> List[str]:
-    patterns = [
-        os.path.join(path, "*_farfield*.txt"),
-        os.path.join(path, "*farfield*.txt"),
-    ]
-
-    files = []
-    for pattern in patterns:
-        files.extend(glob.glob(pattern))
-
-    # unique + sorted
-    return sorted(set(files))
-
-
-def process_path(path: str, theta_max: float, normalize: bool, value_column: int) -> None:
+def process_path(path, theta_max, normalize, value_column, theta_step, phi_step, interp_method):
     if os.path.isfile(path):
-        output_file = build_output_name(path)
-        parse_farfield_file(path, output_file, theta_max, normalize, value_column)
+        parse_farfield_file(
+            input_file=path,
+            output_file=build_output_name(path),
+            theta_max=theta_max,
+            normalize=normalize,
+            value_column=value_column,
+            theta_step=theta_step,
+            phi_step=phi_step,
+            interp_method=interp_method,
+        )
         return
 
     if os.path.isdir(path):
         files = find_farfield_files(path)
-
         if not files:
-            print(f"No matching farfield files found in directory: {path}")
-            print("Expected pattern: *farfield*.txt")
+            print(f"No .txt files found in: {path}")
             return
-
-        print(f"Found {len(files)} farfield file(s) in: {path}")
+        print(f"Found {len(files)} file(s) in: {path}")
         print("=" * 60)
-
-        for input_file in files:
-            output_file = build_output_name(input_file)
-            parse_farfield_file(input_file, output_file, theta_max, normalize, value_column)
+        for f in files:
+            parse_farfield_file(
+                input_file=f,
+                output_file=build_output_name(f),
+                theta_max=theta_max,
+                normalize=normalize,
+                value_column=value_column,
+                theta_step=theta_step,
+                phi_step=phi_step,
+                interp_method=interp_method,
+            )
         return
 
-    print(f"Path does not exist: {path}")
+    raise FileNotFoundError(f"Path does not exist: {path}")
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Convert CST farfield TXT to one normalized .plot matrix."
+        description=(
+            "Convert CST farfield TXT to normalized .plot matrix.\n"
+            "Transform: CST (Z=beam, Y=up) -> Article (X=beam, Z=up).\n"
+            "Interpolates scattered points onto a regular article grid.\n"
+            "Output: phi rows x theta cols, phi in (-180,180], theta in [0, theta_max]."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("path", help="Input CST farfield .txt file or folder")
-    parser.add_argument(
-        "--no-normalize",
-        action="store_true",
-        help="Do not normalize values to max = 1",
-    )
-    parser.add_argument(
-        "--theta-max",
-        type=float,
-        default=90.0,
-        help="Maximum theta to keep, default: 90",
-    )
-    parser.add_argument(
-        "--value-column",
-        type=int,
-        default=2,
-        help="Zero-based column index for value, default: 2 = Abs(Dir.)",
-    )
+
+    parser.add_argument("path", help="CST farfield .txt file or directory.")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Keep raw values (do not scale max to 1).")
+    parser.add_argument("--theta-max", type=float, default=90.0, metavar="DEG",
+                        help="Max article theta to output (default: 90).")
+    parser.add_argument("--theta-step", type=float, default=1.0, metavar="DEG",
+                        help="Output grid step for theta (default: 1.0).")
+    parser.add_argument("--phi-step", type=float, default=1.0, metavar="DEG",
+                        help="Output grid step for phi (default: 1.0).")
+    parser.add_argument("--value-column", type=int, default=2, metavar="COL",
+                        help="Zero-based column index for the value (default: 2 = Abs(Dir.)).")
+    parser.add_argument("--interp", default="linear",
+                        choices=["linear", "nearest", "cubic"],
+                        help="Interpolation method (default: linear).")
 
     args = parser.parse_args()
 
     process_path(
-        args.path,
+        path=args.path,
         theta_max=args.theta_max,
         normalize=not args.no_normalize,
         value_column=args.value_column,
+        theta_step=args.theta_step,
+        phi_step=args.phi_step,
+        interp_method=args.interp,
     )
 
 
